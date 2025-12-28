@@ -5,7 +5,8 @@
 CTrade trade;
 
 //================ INPUTS =================
-input double LotStep        = 0.01;
+input double BaseLot        = 0.01;  // first order volume per side
+input double LotStep        = 0.01;  // used in FIXED_STEP mode
 input double MaxLot         = 0.20;
 
 input int    ATR_Period     = 14;
@@ -16,6 +17,17 @@ input double BalancePctTP   = 0.4;
 input double MinTPUSD       = 5.0;
 
 input ulong  Magic          = 202512;
+
+// Volume leveling
+enum VOLUME_MODE
+{
+   VOLUME_FIXED_STEP = 0,     // next = last + LotStep
+   VOLUME_MULTIPLIER = 1,     // next = last * LotMult
+   VOLUME_RISK_PER_STEP = 2   // next = lot sized so 1 step adverse move ~= RiskPctPerStep% equity
+};
+input VOLUME_MODE VolumeMode = VOLUME_FIXED_STEP;
+input double      LotMult    = 1.25; // used in MULTIPLIER mode
+input double      RiskPctPerStep = 0.10; // used in RISK_PER_STEP mode (percent)
 
 // Smart/safety filters
 input int    MaxSpreadPoints = 200;   // 0 = disabled
@@ -70,6 +82,31 @@ double StepDistance()
    return MathMax(GetATR()*ATR_Mult, MinDistPoints*_Point);
 }
 
+double PointValuePerLot()
+{
+   // Value of 1 point (=_Point) move per 1.0 lot, in account currency.
+   const double tick_val  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+   const double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tick_val<=0.0 || tick_size<=0.0) return 0.0;
+   return (tick_val / tick_size) * _Point;
+}
+
+double RiskLotForStepDistance(const double distPrice)
+{
+   const double pv = PointValuePerLot();
+   if(pv<=0.0) return 0.0;
+
+   const double distPoints = distPrice / _Point;
+   if(distPoints<=0.0) return 0.0;
+
+   const double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   const double riskUsd = equity * (RiskPctPerStep/100.0);
+   if(riskUsd<=0.0) return 0.0;
+
+   // loss ~= distPoints * pv * lot  =>  lot ~= riskUsd / (distPoints * pv)
+   return (riskUsd / (distPoints * pv));
+}
+
 bool SpreadOK()
 {
    if(MaxSpreadPoints<=0) return true;
@@ -81,6 +118,27 @@ bool PositionsSideOK(const int count)
 {
    if(MaxPositionsSide<=0) return true;
    return (count < MaxPositionsSide);
+}
+
+double NextLotForSide(const ENUM_POSITION_TYPE side, const bool isInitial)
+{
+   const double lastLot = (side==POSITION_TYPE_BUY) ? lastBuyLot : lastSellLot;
+
+   if(isInitial || lastLot<=0.0)
+      return BaseLot;
+
+   if(VolumeMode==VOLUME_MULTIPLIER)
+      return lastLot * LotMult;
+
+   if(VolumeMode==VOLUME_RISK_PER_STEP)
+   {
+      const double riskLot = RiskLotForStepDistance(StepDistance());
+      // keep it practical: never go below BaseLot when stepping
+      return MathMax(BaseLot, riskLot);
+   }
+
+   // default: fixed step
+   return lastLot + LotStep;
 }
 
 double Threshold()
@@ -223,7 +281,7 @@ void CheckSteps()
    {
       // add only if price moved AGAINST buys (down) by dist
       if(PositionsSideOK(buyCount) && bid <= (lastBuyPrice - dist))
-         OpenBuy(lastBuyLot + LotStep);
+         OpenBuy(NextLotForSide(POSITION_TYPE_BUY, false));
    }
 
    // SELL side (only add if latest sell is in drawdown)
@@ -231,7 +289,7 @@ void CheckSteps()
    {
       // add only if price moved AGAINST sells (up) by dist
       if(PositionsSideOK(sellCount) && ask >= (lastSellPrice + dist))
-         OpenSell(lastSellLot + LotStep);
+         OpenSell(NextLotForSide(POSITION_TYPE_SELL, false));
    }
 }
 
@@ -265,20 +323,26 @@ void CheckExit()
 //================ INFO =================
 void DrawInfo()
 {
+   const double nextBuyLot  = NormalizeVolume(MathMin(MaxLot, NextLotForSide(POSITION_TYPE_BUY, (buyCount==0))));
+   const double nextSellLot = NormalizeVolume(MathMin(MaxLot, NextLotForSide(POSITION_TYPE_SELL, (sellCount==0))));
+
    Comment(
       "BUY (", buyCount, "):\n",
       "  Last Lot: ",DoubleToString(lastBuyLot,2),
+      "\n  Next Lot: ",DoubleToString(nextBuyLot,2),
       "\n  First Profit: ",DoubleToString(firstBuyProfit,2),
       "\n  Last Profit: ",DoubleToString(lastBuyProfit,2),
       "\n  Profit Total: ",DoubleToString(buyProfitTotal,2),
       "\n\nSELL (", sellCount, "):\n",
       "  Last Lot: ",DoubleToString(lastSellLot,2),
+      "\n  Next Lot: ",DoubleToString(nextSellLot,2),
       "\n  First Profit: ",DoubleToString(firstSellProfit,2),
       "\n  Last Profit: ",DoubleToString(lastSellProfit,2),
       "\n  Profit Total: ",DoubleToString(sellProfitTotal,2),
       "\n\nThreshold: ",DoubleToString(Threshold(),2),
       "\nSpreadOK: ", (SpreadOK() ? "yes" : "no"),
-      "\nStepDist: ", DoubleToString(StepDistance(), _Digits)
+      "\nStepDist: ", DoubleToString(StepDistance(), _Digits),
+      "\nPointValue/lot: ", DoubleToString(PointValuePerLot(), 4)
    );
 }
 
@@ -322,9 +386,9 @@ void OnTick()
 
    // Keep hedge alive per-side (only for this EA/symbol)
    if(buyCount==0)
-      OpenBuy(LotStep);
+      OpenBuy(NextLotForSide(POSITION_TYPE_BUY, true));
    if(sellCount==0)
-      OpenSell(LotStep);
+      OpenSell(NextLotForSide(POSITION_TYPE_SELL, true));
 
    CheckSteps();
    CheckExit();
