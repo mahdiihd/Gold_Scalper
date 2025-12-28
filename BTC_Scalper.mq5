@@ -17,12 +17,17 @@ input double MinTPUSD       = 5.0;
 
 input ulong  Magic          = 202512;
 
+// Smart/safety filters
+input int    MaxSpreadPoints = 200;   // 0 = disabled
+input int    MaxPositionsSide = 20;   // 0 = unlimited
+
 //================ GLOBAL =================
 double lastBuyLot=0,lastSellLot=0;
 double lastBuyPrice=0,lastSellPrice=0;
 double firstBuyProfit=0,lastBuyProfit=0;
 double firstSellProfit=0,lastSellProfit=0;
 int    buyCount=0, sellCount=0;
+double buyProfitTotal=0, sellProfitTotal=0;
 
 int g_atrHandle = INVALID_HANDLE;
 
@@ -63,6 +68,19 @@ double GetATR()
 double StepDistance()
 {
    return MathMax(GetATR()*ATR_Mult, MinDistPoints*_Point);
+}
+
+bool SpreadOK()
+{
+   if(MaxSpreadPoints<=0) return true;
+   const double spreadPts = (SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID)) / _Point;
+   return (spreadPts <= (double)MaxSpreadPoints);
+}
+
+bool PositionsSideOK(const int count)
+{
+   if(MaxPositionsSide<=0) return true;
+   return (count < MaxPositionsSide);
 }
 
 double Threshold()
@@ -120,6 +138,8 @@ void ScanPositions()
    firstSellProfit=lastSellProfit=0;
    buyCount=0;
    sellCount=0;
+   buyProfitTotal=0;
+   sellProfitTotal=0;
 
    datetime buyEarliest=0, buyLatest=0;
    datetime sellEarliest=0, sellLatest=0;
@@ -140,6 +160,7 @@ void ScanPositions()
       if(type==POSITION_TYPE_BUY)
       {
          buyCount++;
+         buyProfitTotal += profit;
 
          if(buyEarliest==0 || t<buyEarliest)
          {
@@ -158,6 +179,7 @@ void ScanPositions()
       else if(type==POSITION_TYPE_SELL)
       {
          sellCount++;
+         sellProfitTotal += profit;
 
          if(sellEarliest==0 || t<sellEarliest)
          {
@@ -199,14 +221,16 @@ void CheckSteps()
    // BUY side (only add if latest buy is in drawdown)
    if(lastBuyLot>0 && lastBuyProfit<0)
    {
-      if(MathAbs(bid - lastBuyPrice) >= dist)
+      // add only if price moved AGAINST buys (down) by dist
+      if(PositionsSideOK(buyCount) && bid <= (lastBuyPrice - dist))
          OpenBuy(lastBuyLot + LotStep);
    }
 
    // SELL side (only add if latest sell is in drawdown)
    if(lastSellLot>0 && lastSellProfit<0)
    {
-      if(MathAbs(ask - lastSellPrice) >= dist)
+      // add only if price moved AGAINST sells (up) by dist
+      if(PositionsSideOK(sellCount) && ask >= (lastSellPrice + dist))
          OpenSell(lastSellLot + LotStep);
    }
 }
@@ -226,28 +250,15 @@ void CloseSide(ENUM_POSITION_TYPE type)
    }
 }
 
-double ExitProfitSumBuy()
-{
-   if(buyCount<=0) return 0.0;
-   if(buyCount==1) return lastBuyProfit;
-   return firstBuyProfit + lastBuyProfit;
-}
-
-double ExitProfitSumSell()
-{
-   if(sellCount<=0) return 0.0;
-   if(sellCount==1) return lastSellProfit;
-   return firstSellProfit + lastSellProfit;
-}
-
 void CheckExit()
 {
    const double th = Threshold();
 
-   if(ExitProfitSumBuy() >= th)
+   // smarter: exit based on TOTAL profit per side
+   if(buyCount>0 && buyProfitTotal >= th)
       CloseSide(POSITION_TYPE_BUY);
 
-   if(ExitProfitSumSell() >= th)
+   if(sellCount>0 && sellProfitTotal >= th)
       CloseSide(POSITION_TYPE_SELL);
 }
 
@@ -259,13 +270,14 @@ void DrawInfo()
       "  Last Lot: ",DoubleToString(lastBuyLot,2),
       "\n  First Profit: ",DoubleToString(firstBuyProfit,2),
       "\n  Last Profit: ",DoubleToString(lastBuyProfit,2),
-      "\n  Exit Sum: ",DoubleToString(ExitProfitSumBuy(),2),
+      "\n  Profit Total: ",DoubleToString(buyProfitTotal,2),
       "\n\nSELL (", sellCount, "):\n",
       "  Last Lot: ",DoubleToString(lastSellLot,2),
       "\n  First Profit: ",DoubleToString(firstSellProfit,2),
       "\n  Last Profit: ",DoubleToString(lastSellProfit,2),
-      "\n  Exit Sum: ",DoubleToString(ExitProfitSumSell(),2),
+      "\n  Profit Total: ",DoubleToString(sellProfitTotal,2),
       "\n\nThreshold: ",DoubleToString(Threshold(),2),
+      "\nSpreadOK: ", (SpreadOK() ? "yes" : "no"),
       "\nStepDist: ", DoubleToString(StepDistance(), _Digits)
    );
 }
@@ -302,13 +314,17 @@ void OnTick()
 {
    ScanPositions();
 
-   // Initial hedge (only for this EA/symbol)
-   if(buyCount==0 && sellCount==0)
+   if(!SpreadOK())
    {
-      OpenBuy(LotStep);
-      OpenSell(LotStep);
+      DrawInfo();
       return;
    }
+
+   // Keep hedge alive per-side (only for this EA/symbol)
+   if(buyCount==0)
+      OpenBuy(LotStep);
+   if(sellCount==0)
+      OpenSell(LotStep);
 
    CheckSteps();
    CheckExit();
